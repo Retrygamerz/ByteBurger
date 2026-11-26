@@ -10,7 +10,7 @@ const { Pool } = require('pg');
 
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const frontendPath = path.resolve(__dirname, '..', 'FrontEND');
+const frontendPath = path.resolve(__dirname, '..');
 const allowedOrigins = (process.env.FRONTEND_ORIGINS || 'http://localhost:5173,http://localhost:3000')
   .split(',')
   .map((origin) => origin.trim())
@@ -315,8 +315,9 @@ app.patch('/api/orders/:id', requireAdmin, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.use(express.static(frontendPath));
-app.get(['/', '/kitchen'], (req, res) => res.sendFile(path.join(frontendPath, 'index.html')));
+app.get('/styles.css', (req, res, next) => res.sendFile(path.join(frontendPath, 'styles.css'), next));
+app.get('/app.js', (req, res, next) => res.sendFile(path.join(frontendPath, 'app.js'), next));
+app.get(['/', '/kitchen'], (req, res, next) => res.sendFile(path.join(frontendPath, 'index.html'), next));
 app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found.' }));
 app.use((req, res) => res.status(404).send('Page not found.'));
 app.use((error, req, res, next) => {

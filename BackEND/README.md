@@ -1,6 +1,6 @@
 # ByteBurger
 
-The Express server serves the storefront in `../FrontEND` and the REST API from the same origin. PostgreSQL is used for menu and order storage.
+The Express server serves `index.html`, `styles.css`, and `app.js` from the project root and serves the REST API from the same origin. PostgreSQL is used for menu and order storage.
 
 ## Run locally
 
