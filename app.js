@@ -6,6 +6,71 @@ const escapeHTML = (value) => String(value).replace(/[&<>"']/g, (character) => (
 }[character]));
 const categories = ['All', 'Burgers', 'Sides', 'Drinks'];
 const statusOptions = ['All', 'Pending', 'Preparing', 'Out for Delivery', 'Delivered'];
+const queryCache = new Map();
+const inFlightQueries = new Map();
+const ordersCacheKey = 'orders:all';
+let searchTimer;
+let menuEvents;
+let kitchenEvents;
+let trackingEvents;
+
+function cloneData(data) {
+  return JSON.parse(JSON.stringify(data));
+}
+
+async function cachedGet(key, url, staleTime, force = false) {
+  const cached = queryCache.get(key);
+  if (!force && cached && Date.now() - cached.updatedAt < staleTime) return cloneData(cached.data);
+  if (inFlightQueries.has(key)) return cloneData(await inFlightQueries.get(key));
+
+  const pending = request(url, { cache: force ? 'no-cache' : 'default' })
+    .then((data) => {
+      queryCache.set(key, { data, updatedAt: Date.now() });
+      return data;
+    })
+    .finally(() => inFlightQueries.delete(key));
+  inFlightQueries.set(key, pending);
+  return cloneData(await pending);
+}
+
+function setCached(key, data) {
+  queryCache.set(key, { data: cloneData(data), updatedAt: Date.now() });
+}
+
+function invalidateCache(key) {
+  queryCache.delete(key);
+}
+
+function setUrlParam(name, value, defaultValue = '') {
+  const url = new URL(location.href);
+  if (value === defaultValue) url.searchParams.delete(name);
+  else url.searchParams.set(name, value);
+  history.replaceState(null, '', url);
+}
+
+function categoryFromUrl() {
+  const value = new URLSearchParams(location.search).get('category') || 'All';
+  return categories.includes(value) ? value : 'All';
+}
+
+function searchFromUrl() {
+  return new URLSearchParams(location.search).get('search') || '';
+}
+
+function orderStatusFromUrl() {
+  const value = new URLSearchParams(location.search).get('status') || 'All';
+  return statusOptions.includes(value) ? value : 'All';
+}
+
+function createIdempotencyKey() {
+  if (window.crypto.randomUUID) return window.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 function toast(message) {
   const element = document.createElement('div');
@@ -16,10 +81,14 @@ function toast(message) {
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
+  const response = await fetch(url, { credentials: 'same-origin', ...options });
   const contentType = response.headers.get('content-type') || '';
   const data = contentType.includes('application/json') ? await response.json() : null;
-  if (!response.ok) throw new Error(data?.error || 'Request failed. Please try again.');
+  if (!response.ok) {
+    const error = new Error(data?.error || 'Request failed. Please try again.');
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -75,8 +144,9 @@ const state = {
   menu: [],
   menuLoading: true,
   menuError: '',
-  category: 'All',
-  search: '',
+  category: categoryFromUrl(),
+  search: searchFromUrl(),
+  searchDraft: searchFromUrl(),
   cart: savedCart,
   cartOpen: false,
   checkout: { customer_name: '', phone: '', address: '' },
@@ -86,9 +156,14 @@ const state = {
   orders: [],
   ordersLoading: true,
   ordersError: '',
-  orderStatus: 'All',
-  adminKey: sessionStorage.getItem('byteburger-admin-key') || '',
-  updatingOrder: ''
+  orderStatus: orderStatusFromUrl(),
+  kitchenAuthenticated: false,
+  authLoading: true,
+  loginKey: '',
+  loginError: '',
+  loginLoading: false,
+  updatingOrder: '',
+  pendingCheckout: null
 };
 
 function saveCart() {
@@ -116,7 +191,7 @@ async function loadMenu() {
   state.menuError = '';
   if (!location.pathname.startsWith('/kitchen')) renderStore();
   try {
-    state.menu = await request('/api/menu');
+    state.menu = await cachedGet('menu:all', '/api/menu', 30_000);
     state.menuLoading = false;
     for (const id of Object.keys(state.cart)) {
       if (!state.menu.some((item) => String(item.id) === String(id))) delete state.cart[id];
@@ -188,8 +263,8 @@ function cartDrawer() {
       <div class="drawer-head"><h2 id="cart-title">Order placed</h2><button class="close-button" data-action="close-cart" aria-label="Close">×</button></div>
       <div class="confirmation"><div class="confirm-mark">✓</div><h3>On its way to the kitchen.</h3>
         <p>Thanks, ${escapeHTML(order.customer_name)}. We’ll call you at ${escapeHTML(order.phone)} if we need anything.<br>
-        Your order number is <span class="order-number">#${escapeHTML(order.id)}</span><br>
-        Status: <span class="order-number">Pending</span></p>
+        Order <span class="order-number">#${escapeHTML(order.id)}</span> · Tracking code <span class="order-number">${escapeHTML(order.tracking_code)}</span><br>
+        Live status: <span class="order-number" id="customer-order-status">${escapeHTML(order.status)}</span></p>
         ${cartSummary(confirmationRows, true)}
         <button class="button button-primary" style="width:100%;margin-top:20px" data-action="finish-order">Back to the menu</button>
       </div></aside></div>`;
@@ -274,6 +349,7 @@ function bindStore() {
   }));
   app.querySelectorAll('[data-action="category"]').forEach((button) => button.addEventListener('click', () => {
     state.category = button.dataset.category;
+    setUrlParam('category', state.category, 'All');
     renderStore();
   }));
   app.querySelectorAll('[data-action="open-cart"]').forEach((button) => button.addEventListener('click', () => {
@@ -297,18 +373,25 @@ function bindStore() {
     renderStore();
   }));
   app.querySelectorAll('[data-action="finish-order"]').forEach((button) => button.addEventListener('click', () => {
+    trackingEvents?.close();
+    trackingEvents = null;
     state.confirmation = null;
     state.cartOpen = false;
     renderStore();
   }));
   app.querySelector('[data-action="retry-menu"]')?.addEventListener('click', loadMenu);
   app.querySelector('#menu-search')?.addEventListener('input', (event) => {
-    state.search = event.target.value;
+    state.searchDraft = event.target.value;
     const cursor = event.target.selectionStart;
-    renderStore();
-    const input = app.querySelector('#menu-search');
-    input.focus();
-    input.setSelectionRange(cursor, cursor);
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(() => {
+      state.search = state.searchDraft;
+      setUrlParam('search', state.search);
+      renderStore();
+      const input = app.querySelector('#menu-search');
+      input?.focus();
+      input?.setSelectionRange(cursor, cursor);
+    }, 280);
   });
   app.querySelectorAll('#checkout-form input, #checkout-form textarea').forEach((field) => field.addEventListener('input', () => {
     state.checkout[field.name] = field.value;
@@ -340,16 +423,18 @@ async function submitOrder(event) {
   try {
     const order = await request('/api/orders', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...state.checkout,
         items: rows.map(({ item, quantity }) => ({ id: item.id, quantity }))
-      })
+      }),
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': getCheckoutIdempotencyKey(rows) }
     });
     state.cart = {};
     state.checkout = { customer_name: '', phone: '', address: '' };
+    state.pendingCheckout = null;
     saveCart();
     state.confirmation = order;
+    startOrderTracking(order);
     toast('Your order is in the kitchen.');
   } catch (error) {
     state.checkoutError = error.message;
@@ -357,6 +442,29 @@ async function submitOrder(event) {
     state.submitting = false;
     renderStore();
   }
+}
+
+function getCheckoutIdempotencyKey(rows) {
+  const signature = JSON.stringify({
+    ...state.checkout,
+    items: rows.map(({ item, quantity }) => [item.id, quantity])
+  });
+  if (!state.pendingCheckout || state.pendingCheckout.signature !== signature) {
+    state.pendingCheckout = { signature, key: createIdempotencyKey() };
+  }
+  return state.pendingCheckout.key;
+}
+
+function startOrderTracking(order) {
+  trackingEvents?.close();
+  trackingEvents = new EventSource(`/api/orders/track/${encodeURIComponent(order.tracking_code)}/events`);
+  trackingEvents.addEventListener('status', (event) => {
+    const update = JSON.parse(event.data);
+    if (!state.confirmation || update.id !== state.confirmation.id) return;
+    state.confirmation.status = update.status;
+    const status = app.querySelector('#customer-order-status');
+    if (status) status.textContent = update.status;
+  });
 }
 
 function formattedDate(value) {
@@ -376,8 +484,8 @@ function orderCard(order) {
       <div class="order-items">${order.items.map((item) => `<div class="order-item"><span>${item.quantity} × ${escapeHTML(item.name)}</span><span>${money(item.subtotal)}</span></div>`).join('')}</div>
     </div>
     <div class="order-bottom"><div class="order-total">${money(order.total)}<small>Includes ${order.delivery_fee ? money(order.delivery_fee) + ' delivery' : 'free delivery'}</small></div>
-      <div class="order-actions">${nextStatus ? `<button class="button button-primary" data-action="advance-order" data-id="${escapeHTML(order.id)}" data-status="${nextStatus}" ${state.updatingOrder === order.id ? 'disabled' : ''}>${state.updatingOrder === order.id ? 'Updating…' : `Mark ${nextStatus} →`}</button>` : ''}
-      ${!['Delivered', 'Cancelled'].includes(order.status) ? `<button class="button button-secondary" data-action="cancel-order" data-id="${escapeHTML(order.id)}" ${state.updatingOrder === order.id ? 'disabled' : ''}>Cancel</button>` : ''}</div>
+      <div class="order-actions">${nextStatus ? `<button class="button button-primary" data-action="advance-order" data-id="${escapeHTML(order.id)}" data-status="${nextStatus}" ${state.updatingOrder ? 'disabled' : ''}>${state.updatingOrder === order.id ? 'Updating…' : `Mark ${nextStatus} →`}</button>` : ''}
+      ${!['Delivered', 'Cancelled'].includes(order.status) ? `<button class="button button-secondary" data-action="cancel-order" data-id="${escapeHTML(order.id)}" ${state.updatingOrder ? 'disabled' : ''}>Cancel</button>` : ''}</div>
     </div>
   </article>`;
 }
@@ -385,20 +493,31 @@ function orderCard(order) {
 function renderKitchen() {
   document.title = 'Kitchen orders — ByteBurger';
   const orders = state.orders.filter((order) => state.orderStatus === 'All' || order.status === state.orderStatus);
+  const board = state.kitchenAuthenticated
+    ? `<div class="kitchen-heading"><div><span class="eyebrow">Behind the counter</span><h1>Kitchen board</h1><p>New orders and status changes arrive live.</p></div>
+        <div class="kitchen-tools"><button class="button button-secondary" data-action="logout">Sign out</button></div>
+      </div>
+      <div class="orders-toolbar"><div class="status-filters" aria-label="Filter orders">${statusOptions.map((status) => `<button class="filter-chip ${state.orderStatus === status ? 'active' : ''}" data-action="order-filter" data-status="${status}" aria-pressed="${state.orderStatus === status}">${status}</button>`).join('')}</div>
+        <button class="button button-secondary" data-action="refresh-orders" ${state.ordersLoading || state.updatingOrder ? 'disabled' : ''}>↻ &nbsp;Refresh orders</button>
+      </div>
+      <div class="orders-grid" aria-live="polite">${state.ordersLoading && !state.orders.length
+        ? '<div class="skeleton" style="height:180px"></div><div class="skeleton" style="height:180px"></div>'
+        : state.ordersError
+          ? `<div class="error-panel">Couldn’t load orders: ${escapeHTML(state.ordersError)}<br><button class="button button-secondary" data-action="refresh-orders">Try again</button></div>`
+          : orders.length ? orders.map(orderCard).join('')
+            : `<div class="empty-state"><strong>${state.orderStatus === 'All' ? 'No orders just yet.' : `No ${escapeHTML(state.orderStatus.toLowerCase())} orders.`}</strong><p>New orders will show up here as soon as they’re placed.</p></div>`}
+      </div>`
+    : `<section class="kitchen-login" aria-labelledby="kitchen-login-title">
+        <span class="eyebrow">Staff access</span><h1 id="kitchen-login-title">Kitchen sign in</h1>
+        <p>Sign in with the kitchen key to view and manage orders.</p>
+        <form id="kitchen-login-form" class="checkout">
+          <div class="field"><label for="kitchen-key">Kitchen key</label><input id="kitchen-key" name="key" type="password" autocomplete="current-password" required value="${escapeHTML(state.loginKey)}"></div>
+          ${state.loginError ? `<p class="form-error" role="alert">${escapeHTML(state.loginError)}</p>` : ''}
+          <button class="button button-primary" type="submit" ${state.loginLoading || state.authLoading ? 'disabled' : ''}>${state.authLoading ? 'Checking session…' : state.loginLoading ? 'Signing in…' : 'Sign in'}</button>
+        </form>
+      </section>`;
   app.innerHTML = `<div class="kitchen-page">${header(true)}<main class="shell kitchen-main">
-    <div class="kitchen-heading"><div><span class="eyebrow">Behind the counter</span><h1>Kitchen board</h1><p>Keep good food moving. Orders refresh automatically every 15 seconds.</p></div>
-      <div class="kitchen-tools"><input class="admin-key" type="password" id="admin-key" autocomplete="off" placeholder="Kitchen admin key" aria-label="Kitchen admin key" value="${escapeHTML(state.adminKey)}"><button class="button button-secondary" data-action="save-key">Save key</button></div>
-    </div>
-    <div class="orders-toolbar"><div class="status-filters" aria-label="Filter orders">${statusOptions.map((status) => `<button class="filter-chip ${state.orderStatus === status ? 'active' : ''}" data-action="order-filter" data-status="${status}" aria-pressed="${state.orderStatus === status}">${status}</button>`).join('')}</div>
-      <button class="button button-secondary" data-action="refresh-orders" ${state.ordersLoading ? 'disabled' : ''}>↻ &nbsp;Refresh orders</button>
-    </div>
-    <div class="orders-grid" aria-live="polite">${state.ordersLoading && !state.orders.length
-      ? '<div class="skeleton" style="height:180px"></div><div class="skeleton" style="height:180px"></div>'
-      : state.ordersError
-        ? `<div class="error-panel">Couldn’t load orders: ${escapeHTML(state.ordersError)}<br><button class="button button-secondary" data-action="refresh-orders">Try again</button></div>`
-        : orders.length ? orders.map(orderCard).join('')
-          : `<div class="empty-state"><strong>${state.orderStatus === 'All' ? 'No orders just yet.' : `No ${escapeHTML(state.orderStatus.toLowerCase())} orders.`}</strong><p>New orders will show up here as soon as they’re placed.</p></div>`}
-    </div>
+    ${board}
     <footer class="site-footer kitchen-footer"><div class="footer-inner"><span class="footer-brand">byteburger · Kitchen</span><span>Ayesha Manzil, Plot A-255</span></div></footer>
   </main></div>`;
   bindKitchen();
@@ -407,31 +526,122 @@ function renderKitchen() {
 function bindKitchen() {
   app.querySelectorAll('[data-action="order-filter"]').forEach((button) => button.addEventListener('click', () => {
     state.orderStatus = button.dataset.status;
+    setUrlParam('status', state.orderStatus, 'All');
     renderKitchen();
   }));
-  app.querySelectorAll('[data-action="refresh-orders"]').forEach((button) => button.addEventListener('click', loadOrders));
-  app.querySelector('[data-action="save-key"]')?.addEventListener('click', () => {
-    state.adminKey = app.querySelector('#admin-key').value.trim();
-    sessionStorage.setItem('byteburger-admin-key', state.adminKey);
-    toast(state.adminKey ? 'Kitchen key saved for this session.' : 'Kitchen key cleared.');
-    loadOrders();
-  });
+  app.querySelectorAll('[data-action="refresh-orders"]').forEach((button) => button.addEventListener('click', () => loadOrders(true)));
+  app.querySelector('#kitchen-login-form')?.addEventListener('submit', signInToKitchen);
+  app.querySelector('[data-action="logout"]')?.addEventListener('click', signOutOfKitchen);
   app.querySelectorAll('[data-action="advance-order"], [data-action="cancel-order"]').forEach((button) => button.addEventListener('click', () => {
     const status = button.dataset.status || 'Cancelled';
     updateOrder(button.dataset.id, status);
   }));
 }
 
-async function loadOrders() {
+async function checkKitchenSession() {
+  try {
+    const session = await request('/api/auth/session', { cache: 'no-store' });
+    state.kitchenAuthenticated = session.authenticated && session.role === 'admin';
+  } catch (error) {
+    state.kitchenAuthenticated = false;
+    state.loginError = error.message;
+  } finally {
+    state.authLoading = false;
+    renderKitchen();
+  }
+  if (state.kitchenAuthenticated) {
+    connectKitchenEvents();
+    loadOrders();
+  }
+}
+
+async function signInToKitchen(event) {
+  event.preventDefault();
+  state.loginKey = String(new FormData(event.currentTarget).get('key') || '');
+  if (!state.loginKey) return;
+  state.loginLoading = true;
+  state.loginError = '';
+  renderKitchen();
+  try {
+    await request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: state.loginKey })
+    });
+    state.loginKey = '';
+    state.kitchenAuthenticated = true;
+    invalidateCache(ordersCacheKey);
+    toast('Signed in to the kitchen.');
+  } catch (error) {
+    state.loginKey = '';
+    state.loginError = error.message;
+  } finally {
+    state.loginLoading = false;
+    renderKitchen();
+  }
+  if (state.kitchenAuthenticated) {
+    connectKitchenEvents();
+    loadOrders(true);
+  } else {
+    app.querySelector('#kitchen-key')?.focus();
+  }
+}
+
+async function signOutOfKitchen() {
+  try {
+    await request('/api/auth/logout', { method: 'POST' });
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    kitchenEvents?.close();
+    kitchenEvents = null;
+    state.kitchenAuthenticated = false;
+    state.orders = [];
+    invalidateCache(ordersCacheKey);
+    renderKitchen();
+  }
+}
+
+function connectKitchenEvents() {
+  if (kitchenEvents || !state.kitchenAuthenticated) return;
+  kitchenEvents = new EventSource('/api/kitchen/events');
+  kitchenEvents.addEventListener('order', () => {
+    invalidateCache(ordersCacheKey);
+    loadOrders(true);
+  });
+  kitchenEvents.onerror = () => {
+    if (kitchenEvents?.readyState === EventSource.CLOSED) {
+      kitchenEvents.close();
+      kitchenEvents = null;
+      state.kitchenAuthenticated = false;
+      renderKitchen();
+    }
+  };
+}
+
+function connectMenuEvents() {
+  if (menuEvents) return;
+  menuEvents = new EventSource('/api/menu/events');
+  menuEvents.addEventListener('menu', () => {
+    invalidateCache('menu:all');
+    loadMenu({ force: true });
+  });
+}
+
+async function loadOrders(force = false) {
+  if (!state.kitchenAuthenticated) return;
   state.ordersLoading = true;
   state.ordersError = '';
   renderKitchen();
   try {
-    state.orders = await request('/api/orders', {
-      headers: { 'x-admin-key': state.adminKey }
-    });
+    state.orders = await cachedGet(ordersCacheKey, '/api/orders', 10_000, force);
   } catch (error) {
     state.ordersError = error.message;
+    if (error.status === 401) {
+      state.kitchenAuthenticated = false;
+      kitchenEvents?.close();
+      kitchenEvents = null;
+    }
   } finally {
     state.ordersLoading = false;
     renderKitchen();
@@ -439,30 +649,31 @@ async function loadOrders() {
 }
 
 async function updateOrder(id, status) {
-  if (!state.adminKey) {
-    toast('Add and save the kitchen admin key first.');
-    app.querySelector('#admin-key')?.focus();
-    return;
-  }
+  if (!state.kitchenAuthenticated || state.updatingOrder) return;
   const previousOrder = state.orders.find((order) => order.id === id);
   state.updatingOrder = id;
   state.orders = state.orders.map((order) => order.id === id ? { ...order, status } : order);
+  setCached(ordersCacheKey, state.orders);
   renderKitchen();
   try {
     const updated = await request(`/api/orders/${encodeURIComponent(id)}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', 'x-admin-key': state.adminKey },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status })
     });
     state.orders = state.orders.map((order) => order.id === updated.id ? updated : order);
+    setCached(ordersCacheKey, state.orders);
     toast(`Order #${updated.id} marked ${status.toLowerCase()}.`);
   } catch (error) {
     if (previousOrder) state.orders = state.orders.map((order) => order.id === id ? previousOrder : order);
+    setCached(ordersCacheKey, state.orders);
     toast(error.message);
-    if (error.message.includes('admin key')) {
-      state.adminKey = '';
-      sessionStorage.removeItem('byteburger-admin-key');
+    if (error.status === 401) {
+      state.kitchenAuthenticated = false;
+      kitchenEvents?.close();
+      kitchenEvents = null;
     }
+    if (state.kitchenAuthenticated) await loadOrders(true);
   } finally {
     state.updatingOrder = '';
     renderKitchen();
@@ -471,11 +682,43 @@ async function updateOrder(id, status) {
 
 if (location.pathname.startsWith('/kitchen')) {
   renderKitchen();
-  loadOrders();
-  window.setInterval(() => {
-    if (!document.hidden && !state.ordersLoading) loadOrders();
-  }, 15000);
+  checkKitchenSession();
+  window.addEventListener('focus', () => {
+    if (state.kitchenAuthenticated) loadOrders(true);
+  });
 } else {
   renderStore();
   loadMenu();
+  connectMenuEvents();
+  window.addEventListener('focus', () => loadMenu({ force: true }));
 }
+
+window.addEventListener('popstate', () => {
+  state.category = categoryFromUrl();
+  state.search = searchFromUrl();
+  state.searchDraft = state.search;
+  state.orderStatus = orderStatusFromUrl();
+  if (location.pathname.startsWith('/kitchen')) renderKitchen();
+  else renderStore();
+});
+
+document.addEventListener('keydown', (event) => {
+  const dialog = app.querySelector('[role="dialog"]');
+  if (!dialog) return;
+  if (event.key === 'Escape') {
+    closeCart();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = [...dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), a[href]')];
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});

@@ -1,16 +1,15 @@
 # ByteBurger
 
-The Express server serves `index.html`, `styles.css`, and `app.js` from the project root and serves the REST API from the same origin. PostgreSQL is used for menu and order storage.
+The Express server serves `index.html`, `styles.css`, and `app.js` from the project root and serves the REST API from the same origin. Supabase provides PostgreSQL storage for the menu and orders.
 
-## Run locally
+## Set up Supabase
 
-1. Install Node.js 18 or newer and PostgreSQL.
-2. Create a database named `byteburger`.
-3. In `BackEND`, copy `.env.example` to `.env` and set `DATABASE_URL` and a private `ADMIN_API_KEY`.
-4. Run `npm install`, then `npm run seed` to create the tables and load the starter menu.
-5. Run `npm start` and open `http://localhost:3000`. The kitchen board is at `http://localhost:3000/kitchen`.
+1. In the Supabase project SQL Editor, run `supabase-migration.sql`. It adds menu columns to the existing `public."BurgerByte"` table and creates the order tables and atomic order-creation function. The migration stops without deleting data if the table already contains rows without menu names.
+2. In Supabase project API settings, copy a server-side **secret key** (or the legacy `service_role` key). Keep it private; never put it in frontend code or commit it.
+3. Copy `.env.example` to `.env` in `BackEND`. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side secret, and replace `ADMIN_API_KEY` with a private random secret.
+4. From `BackEND`, run `npm install`, `npm run seed`, and `npm start`. Open `http://localhost:3000`; the kitchen board is at `http://localhost:3000/kitchen`.
 
-The server creates/updates the database tables on startup. `npm run seed` can be run again safely; it updates the five starter menu entries without deleting orders or changing availability.
+The Supabase secret stays on the backend, where Row Level Security is enabled for the tables. Admin API routes additionally require the `x-admin-key` configured by `ADMIN_API_KEY`. `npm run seed` can be run again safely; it updates the starter item names, categories, and prices without changing their availability or existing orders. Existing local database files are left untouched but are no longer used by the app.
 
 ## API
 

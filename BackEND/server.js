@@ -1,37 +1,84 @@
 require('dotenv').config();
 
-const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
-const { Pool } = require('pg');
+const { createDatabaseClient } = require('./database');
+const { createSessionCookie, clearSessionCookie, readSession } = require('./session');
 
 const app = express();
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+let supabase;
+let realtimeChannel;
+let menuCache;
 const frontendPath = path.resolve(__dirname, '..');
+const menuCacheMs = 30_000;
 const allowedOrigins = (process.env.FRONTEND_ORIGINS || 'http://localhost:5173,http://localhost:3000')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
 const statuses = ['Pending', 'Preparing', 'Out for Delivery', 'Delivered', 'Cancelled'];
+const kitchenStreams = new Set();
+const menuStreams = new Set();
+const trackingStreams = new Map();
+
+function log(level, message, fields = {}) {
+  const record = { timestamp: new Date().toISOString(), level, message, ...fields };
+  console[level === 'error' ? 'error' : 'log'](JSON.stringify(record));
+}
+
+function safeRoutePath(pathname) {
+  if (pathname.startsWith('/api/orders/track/')) {
+    return pathname.replace(/^\/api\/orders\/track\/[^/]+/, '/api/orders/track/:trackingCode');
+  }
+  return pathname.replace(/^\/api\/orders\/[^/]+/, '/api/orders/:id');
+}
 
 app.disable('x-powered-by');
+app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
 app.use((req, res, next) => {
   const startedAt = Date.now();
+  req.requestId = crypto.randomUUID();
+  res.setHeader('X-Request-Id', req.requestId);
   res.on('finish', () => {
-    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - startedAt}ms`);
+    log('info', 'http_request', {
+      request_id: req.requestId,
+      method: req.method,
+      path: safeRoutePath(req.path),
+      status: res.statusCode,
+      duration_ms: Date.now() - startedAt
+    });
   });
   next();
 });
+const isProduction = process.env.NODE_ENV === 'production';
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      styleSrcAttr: ["'unsafe-inline'"],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com'],
+      imgSrc: ["'self'", 'data:'],
+      connectSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'self'"],
+      upgradeInsecureRequests: isProduction ? [] : null
+    }
+  },
+  strictTransportSecurity: isProduction ? { maxAge: 15_552_000, includeSubDomains: true } : false
+}));
 app.use(cors({
   origin(origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
     const error = new Error('This origin is not allowed by CORS.');
     error.status = 403;
     return callback(error);
-  }
+  },
+  credentials: true
 }));
 app.use(express.json({ limit: '32kb' }));
 
@@ -42,15 +89,96 @@ function httpError(status, message) {
 }
 
 function requireAdmin(req, res, next) {
-  const configuredKey = process.env.ADMIN_API_KEY;
-  const suppliedKey = req.get('x-admin-key') || '';
-  if (!configuredKey) return next(httpError(503, 'Admin actions are disabled until ADMIN_API_KEY is configured.'));
-  const expected = Buffer.from(configuredKey);
-  const supplied = Buffer.from(suppliedKey);
-  if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
-    return next(httpError(401, 'A valid admin key is required.'));
-  }
+  const session = readSession(req.headers.cookie, process.env.SESSION_SECRET);
+  if (!session || session.role !== 'admin') return next(httpError(401, 'Please sign in to the kitchen.'));
+  req.session = session;
   return next();
+}
+
+function sendEvent(res, event, data) {
+  if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function openEventStream(req, res, clients, initialEvent, initialData) {
+  res.status(200).set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+  res.write('retry: 3000\n\n');
+  clients.add(res);
+  if (initialEvent) sendEvent(res, initialEvent, initialData);
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(': keepalive\n\n');
+  }, 25_000);
+  heartbeat.unref();
+  res.on('close', () => {
+    clearInterval(heartbeat);
+    clients.delete(res);
+  });
+}
+
+function publish(clients, event, data) {
+  for (const client of clients) sendEvent(client, event, data);
+}
+
+function publishOrderChange(order) {
+  const event = { id: String(order.id), status: order.status };
+  publish(kitchenStreams, 'order', event);
+  if (order.tracking_code) {
+    publish(trackingStreams.get(order.tracking_code) || new Set(), 'status', event);
+  }
+}
+
+function invalidateMenu() {
+  menuCache = null;
+  publish(menuStreams, 'menu', { updated: true });
+}
+
+async function getMenu() {
+  if (menuCache && Date.now() - menuCache.cachedAt < menuCacheMs) return menuCache.items;
+  const { data, error } = await supabase
+    .from('BurgerByte')
+    .select('id, name, category, price, is_available')
+    .order('id', { ascending: true });
+  if (error) throw error;
+  menuCache = { items: data, cachedAt: Date.now() };
+  return data;
+}
+
+function getPublicOrder(order) {
+  return {
+    id: String(order.id),
+    tracking_code: order.tracking_code,
+    status: order.status,
+    created_at: order.created_at,
+    total: Number(order.total),
+    items: order.byteburger_order_items.map((item) => ({
+      id: item.menu_item_id === null ? null : Number(item.menu_item_id),
+      name: item.item_name,
+      price: Number(item.unit_price),
+      quantity: item.quantity,
+      subtotal: Number(item.line_total)
+    }))
+  };
+}
+
+function subscribeToDatabaseChanges() {
+  realtimeChannel = supabase
+    .channel('byteburger-server-events')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'byteburger_orders' }, (payload) => {
+      const order = payload.new && payload.new.id ? payload.new : payload.old;
+      if (order && order.id) publishOrderChange(order);
+    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'BurgerByte' }, invalidateMenu)
+    .subscribe((status, error) => {
+      if (status === 'SUBSCRIBED') log('info', 'supabase_realtime_connected');
+      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        log('error', 'supabase_realtime_error', { status, error: error?.message });
+      }
+    });
 }
 
 function validateMenuInput(body, partial) {
@@ -94,7 +222,7 @@ function validateOrder(body) {
   }
   const seen = new Set();
   const items = body.items.map((item) => {
-    if (!item || !Number.isInteger(Number(item.id)) || Number(item.id) < 1 ||
+    if (!item || !Number.isSafeInteger(Number(item.id)) || Number(item.id) < 1 ||
         !Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 50) {
       throw httpError(400, 'Each item needs a valid menu ID and a quantity between 1 and 50.');
     }
@@ -111,74 +239,132 @@ function validateOrder(body) {
   };
 }
 
+async function loadOrders(status) {
+  let query = supabase
+    .from('byteburger_orders')
+    .select('*, byteburger_order_items(*)')
+    .order('created_at', { ascending: false });
+  if (status) query = query.eq('status', status);
+  const { data, error } = await query;
+  if (error) throw error;
+  return data.map((order) => formatOrder(order, order.byteburger_order_items || []));
+}
+
+async function loadOrderById(id) {
+  const { data, error } = await supabase
+    .from('byteburger_orders')
+    .select('*, byteburger_order_items(*)')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? formatOrder(data, data.byteburger_order_items || []) : null;
+}
+
 function formatOrder(row, items) {
   return {
     id: String(row.id),
+    tracking_code: row.tracking_code,
     customer_name: row.customer_name,
     phone: row.phone,
     address: row.address,
     subtotal: Number(row.subtotal),
-    delivery_fee: row.delivery_fee,
+    delivery_fee: Number(row.delivery_fee),
     total: Number(row.total),
     status: row.status,
     created_at: row.created_at,
     items: items.map((item) => ({
-      id: item.menu_item_id === null ? null : item.menu_item_id,
+      id: item.menu_item_id === null ? null : Number(item.menu_item_id),
       name: item.item_name,
-      price: item.unit_price,
+      price: Number(item.unit_price),
       quantity: item.quantity,
       subtotal: Number(item.line_total)
     }))
   };
 }
 
-async function loadOrders(whereSql = '', values = []) {
-  const orders = await pool.query(`SELECT * FROM orders ${whereSql} ORDER BY created_at DESC`, values);
-  if (orders.rows.length === 0) return [];
-  const orderIds = orders.rows.map((order) => order.id);
-  const itemRows = await pool.query(
-    'SELECT * FROM order_items WHERE order_id = ANY($1::bigint[]) ORDER BY id',
-    [orderIds]
-  );
-  const grouped = new Map();
-  for (const item of itemRows.rows) {
-    if (!grouped.has(String(item.order_id))) grouped.set(String(item.order_id), []);
-    grouped.get(String(item.order_id)).push(item);
-  }
-  return orders.rows.map((order) => formatOrder(order, grouped.get(String(order.id)) || []));
-}
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many sign-in attempts. Please wait 15 minutes and try again.' }
+});
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/api/auth/session', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const session = readSession(req.headers.cookie, process.env.SESSION_SECRET);
+  res.json({ authenticated: Boolean(session), role: session?.role || null });
+});
+
+app.post('/api/auth/login', loginLimiter, (req, res, next) => {
+  const configuredKey = process.env.ADMIN_API_KEY || '';
+  const suppliedKey = typeof req.body?.key === 'string' ? req.body.key : '';
+  if (!configuredKey) return next(httpError(503, 'Kitchen sign-in is not configured.'));
+  const expected = Buffer.from(configuredKey);
+  const supplied = Buffer.from(suppliedKey);
+  if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
+    return next(httpError(401, 'Incorrect kitchen key.'));
+  }
+  res.set({
+    'Cache-Control': 'no-store',
+    'Set-Cookie': createSessionCookie(process.env.SESSION_SECRET, isProduction)
+  });
+  return res.json({ authenticated: true, role: 'admin' });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.set({
+    'Cache-Control': 'no-store',
+    'Set-Cookie': clearSessionCookie(isProduction)
+  });
+  res.json({ authenticated: false });
+});
+
+app.get('/api/health', async (req, res, next) => {
+  try {
+    const { error } = await supabase.from('BurgerByte').select('id').limit(1);
+    if (error) throw error;
+    res.json({ status: 'ok' });
+  } catch (error) { next(error); }
+});
 
 app.get('/api/menu', async (req, res, next) => {
   try {
-    const conditions = [];
-    const values = [];
     if (req.query.category) {
       if (!['Burgers', 'Sides', 'Drinks'].includes(req.query.category)) throw httpError(400, 'Unknown menu category.');
-      values.push(req.query.category);
-      conditions.push(`category = $${values.length}`);
     }
     if (req.query.available !== undefined) {
       if (!['true', 'false'].includes(req.query.available)) throw httpError(400, 'available must be true or false.');
-      values.push(req.query.available === 'true');
-      conditions.push(`is_available = $${values.length}`);
     }
-    const result = await pool.query(
-      `SELECT id, name, category, price, is_available FROM menu_items ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''} ORDER BY id`
+    const items = await getMenu();
+    const filtered = items.filter((item) =>
+      (!req.query.category || item.category === req.query.category) &&
+      (req.query.available === undefined || item.is_available === (req.query.available === 'true'))
     );
-    res.json(result.rows);
+    const response = JSON.stringify(filtered);
+    const etag = `"${crypto.createHash('sha256').update(response).digest('base64url')}"`;
+    res.set({
+      'Cache-Control': 'public, max-age=30, stale-while-revalidate=60',
+      ETag: etag
+    });
+    if (req.get('if-none-match') === etag) return res.status(304).end();
+    res.type('json').send(response);
   } catch (error) { next(error); }
 });
+
+app.get('/api/menu/events', (req, res) => openEventStream(req, res, menuStreams, 'connected', { connected: true }));
 
 app.post('/api/menu', requireAdmin, async (req, res, next) => {
   try {
     const item = validateMenuInput(req.body, false);
-    const result = await pool.query(
-      'INSERT INTO menu_items (name, category, price, is_available) VALUES ($1, $2, $3, $4) RETURNING id, name, category, price, is_available',
-      [item.name, item.category, item.price, item.is_available]
-    );
-    res.status(201).json(result.rows[0]);
+    const { data, error } = await supabase
+      .from('BurgerByte')
+      .insert(item)
+      .select('id, name, category, price, is_available')
+      .single();
+    if (error) throw error;
+    invalidateMenu();
+    res.status(201).json(data);
   } catch (error) {
     if (error.code === '23505') return next(httpError(409, 'A menu item with this name already exists.'));
     return next(error);
@@ -189,16 +375,16 @@ app.patch('/api/menu/:id', requireAdmin, async (req, res, next) => {
   try {
     if (!/^\d+$/.test(req.params.id)) throw httpError(400, 'Menu ID must be a positive integer.');
     const fields = validateMenuInput(req.body, true);
-    const columns = { name: 'name', category: 'category', price: 'price', is_available: 'is_available' };
-    const values = Object.values(fields);
-    const assignments = Object.keys(fields).map((field, index) => `${columns[field]} = $${index + 1}`);
-    values.push(Number(req.params.id));
-    const result = await pool.query(
-      `UPDATE menu_items SET ${assignments.join(', ')} WHERE id = $${values.length} RETURNING id, name, category, price, is_available`,
-      values
-    );
-    if (!result.rowCount) throw httpError(404, 'Menu item not found.');
-    res.json(result.rows[0]);
+    const { data, error } = await supabase
+      .from('BurgerByte')
+      .update(fields)
+      .eq('id', req.params.id)
+      .select('id, name, category, price, is_available')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) throw httpError(404, 'Menu item not found.');
+    invalidateMenu();
+    res.json(data);
   } catch (error) {
     if (error.code === '23505') return next(httpError(409, 'A menu item with this name already exists.'));
     return next(error);
@@ -208,8 +394,15 @@ app.patch('/api/menu/:id', requireAdmin, async (req, res, next) => {
 app.delete('/api/menu/:id', requireAdmin, async (req, res, next) => {
   try {
     if (!/^\d+$/.test(req.params.id)) throw httpError(400, 'Menu ID must be a positive integer.');
-    const result = await pool.query('DELETE FROM menu_items WHERE id = $1 RETURNING id', [Number(req.params.id)]);
-    if (!result.rowCount) throw httpError(404, 'Menu item not found.');
+    const { data, error } = await supabase
+      .from('BurgerByte')
+      .delete()
+      .eq('id', req.params.id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) throw httpError(404, 'Menu item not found.');
+    invalidateMenu();
     res.status(204).end();
   } catch (error) { next(error); }
 });
@@ -223,73 +416,82 @@ const orderLimiter = rateLimit({
 });
 
 app.post('/api/orders', orderLimiter, async (req, res, next) => {
-  let client;
   try {
-    const order = validateOrder(req.body);
-    client = await pool.connect();
-    await client.query('BEGIN');
-    const menuResult = await client.query(
-      'SELECT id, name, price, is_available FROM menu_items WHERE id = ANY($1::int[]) FOR SHARE',
-      [order.items.map((item) => item.id)]
-    );
-    const menuById = new Map(menuResult.rows.map((item) => [item.id, item]));
-    const orderItems = order.items.map((requested) => {
-      const menuItem = menuById.get(requested.id);
-      if (!menuItem) throw httpError(400, `Menu item ${requested.id} no longer exists.`);
-      if (!menuItem.is_available) throw httpError(409, `${menuItem.name} is sold out.`);
-      return {
-        menu_item_id: menuItem.id,
-        item_name: menuItem.name,
-        unit_price: menuItem.price,
-        quantity: requested.quantity,
-        line_total: menuItem.price * requested.quantity
-      };
-    });
-    const subtotal = orderItems.reduce((sum, item) => sum + item.line_total, 0);
-    const deliveryFee = subtotal >= 2500 ? 0 : 200;
-    const inserted = await client.query(
-      `INSERT INTO orders (customer_name, phone, address, subtotal, delivery_fee, total)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [order.customer_name, order.phone, order.address, subtotal, deliveryFee, subtotal + deliveryFee]
-    );
-    for (const item of orderItems) {
-      await client.query(
-        `INSERT INTO order_items (order_id, menu_item_id, item_name, unit_price, quantity, line_total)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [inserted.rows[0].id, item.menu_item_id, item.item_name, item.unit_price, item.quantity, item.line_total]
-      );
+    const idempotencyKey = req.get('idempotency-key') || '';
+    if (!/^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(idempotencyKey)) {
+      throw httpError(400, 'A valid Idempotency-Key UUID header is required.');
     }
-    await client.query('COMMIT');
-    res.status(201).json(formatOrder(inserted.rows[0], orderItems));
+    const order = validateOrder(req.body);
+    const { data, error } = await supabase.rpc('create_byteburger_order', {
+      p_customer_name: order.customer_name,
+      p_phone: order.phone,
+      p_address: order.address,
+      p_items: order.items,
+      p_idempotency_key: idempotencyKey,
+      p_tracking_code: crypto.randomBytes(24).toString('base64url')
+    });
+    if (error) {
+      if (error.code === '22023') throw httpError(400, error.message);
+      if (error.code === 'P0001') throw httpError(409, error.message);
+      throw error;
+    }
+    publishOrderChange(data);
+    res.status(201).json(data);
   } catch (error) {
-    if (client) await client.query('ROLLBACK').catch((rollbackError) => console.error('Order rollback failed:', rollbackError));
     return next(error);
-  } finally {
-    if (client) client.release();
   }
 });
 
 app.get('/api/orders', requireAdmin, async (req, res, next) => {
   try {
     if (req.query.status && !statuses.includes(req.query.status)) throw httpError(400, 'Unknown order status.');
-    const where = req.query.status ? 'WHERE status = $1' : '';
-    res.json(await loadOrders(where, req.query.status ? [req.query.status] : []));
+    res.set('Cache-Control', 'no-store');
+    res.json(await loadOrders(req.query.status));
   } catch (error) { next(error); }
 });
 
-app.get('/api/orders/:id', async (req, res, next) => {
+app.get('/api/kitchen/events', requireAdmin, (req, res) => {
+  openEventStream(req, res, kitchenStreams, 'connected', { connected: true });
+});
+
+app.get('/api/orders/track/:trackingCode/events', async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('byteburger_orders')
+      .select('id, tracking_code, status')
+      .eq('tracking_code', req.params.trackingCode)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) throw httpError(404, 'Order tracking code not found.');
+    if (!trackingStreams.has(data.tracking_code)) trackingStreams.set(data.tracking_code, new Set());
+    const clients = trackingStreams.get(data.tracking_code);
+    openEventStream(req, res, clients, 'status', { id: String(data.id), status: data.status });
+    res.on('close', () => {
+      if (clients.size === 0) trackingStreams.delete(data.tracking_code);
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/orders/track/:trackingCode', async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('byteburger_orders')
+      .select('id, tracking_code, status, created_at, total, byteburger_order_items(menu_item_id, item_name, unit_price, quantity, line_total)')
+      .eq('tracking_code', req.params.trackingCode)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) throw httpError(404, 'Order tracking code not found.');
+    res.set('Cache-Control', 'no-store').json(getPublicOrder(data));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/orders/:id', requireAdmin, async (req, res, next) => {
   try {
     if (!/^\d+$/.test(req.params.id)) throw httpError(400, 'Order ID must be a positive integer.');
-    const orders = await loadOrders('WHERE id = $1', [req.params.id]);
-    if (!orders.length) throw httpError(404, 'Order not found.');
-    const order = orders[0];
-    res.json({
-      id: order.id,
-      status: order.status,
-      created_at: order.created_at,
-      total: order.total,
-      items: order.items
-    });
+    const order = await loadOrderById(req.params.id);
+    if (!order) throw httpError(404, 'Order not found.');
+    res.set('Cache-Control', 'no-store');
+    res.json(order);
   } catch (error) { next(error); }
 });
 
@@ -298,8 +500,16 @@ app.patch('/api/orders/:id', requireAdmin, async (req, res, next) => {
     if (!/^\d+$/.test(req.params.id)) throw httpError(400, 'Order ID must be a positive integer.');
     const { status } = req.body || {};
     if (!statuses.includes(status)) throw httpError(400, 'Choose a valid order status.');
-    const current = await pool.query('SELECT status FROM orders WHERE id = $1', [req.params.id]);
-    if (!current.rowCount) throw httpError(404, 'Order not found.');
+    const { data: current, error: lookupError } = await supabase
+      .from('byteburger_orders')
+      .select('status')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (lookupError) throw lookupError;
+    if (!current) throw httpError(404, 'Order not found.');
+    if (current.status === status) {
+      return res.json(await loadOrderById(req.params.id));
+    }
     const nextByStatus = {
       Pending: ['Preparing', 'Cancelled'],
       Preparing: ['Out for Delivery', 'Cancelled'],
@@ -307,32 +517,72 @@ app.patch('/api/orders/:id', requireAdmin, async (req, res, next) => {
       Delivered: [],
       Cancelled: []
     };
-    if (!nextByStatus[current.rows[0].status].includes(status)) {
-      throw httpError(409, `Cannot change an order from ${current.rows[0].status} to ${status}.`);
+    if (!nextByStatus[current.status].includes(status)) {
+      throw httpError(409, `Cannot change an order from ${current.status} to ${status}.`);
     }
-    await pool.query('UPDATE orders SET status = $1 WHERE id = $2', [status, req.params.id]);
-    res.json((await loadOrders('WHERE id = $1', [req.params.id]))[0]);
+    const { data: updated, error: updateError } = await supabase
+      .from('byteburger_orders')
+      .update({ status })
+      .eq('id', req.params.id)
+      .eq('status', current.status)
+      .select('id')
+      .maybeSingle();
+    if (updateError) throw updateError;
+    if (!updated) throw httpError(409, 'The order status changed before this update could be saved. Refresh and try again.');
+    const order = await loadOrderById(req.params.id);
+    publishOrderChange(order);
+    res.json(order);
   } catch (error) { next(error); }
 });
 
-app.get('/styles.css', (req, res, next) => res.sendFile(path.join(frontendPath, 'styles.css'), next));
-app.get('/app.js', (req, res, next) => res.sendFile(path.join(frontendPath, 'app.js'), next));
-app.get(['/', '/kitchen'], (req, res, next) => res.sendFile(path.join(frontendPath, 'index.html'), next));
+function sendFrontendFile(res, filename, next) {
+  res.sendFile(path.join(frontendPath, filename), (error) => {
+    if (error) next(error);
+  });
+}
+
+app.get('/styles.css', (req, res, next) => sendFrontendFile(res, 'styles.css', next));
+app.get('/app.js', (req, res, next) => sendFrontendFile(res, 'app.js', next));
+app.get(['/', '/kitchen'], (req, res, next) => sendFrontendFile(res, 'index.html', next));
 app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found.' }));
 app.use((req, res) => res.status(404).send('Page not found.'));
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
-  const status = error.status || (error.type === 'entity.parse.failed' ? 400 : 500);
-  if (status >= 500) console.error(error);
-  res.status(status).json({ error: status >= 500 ? 'Something went wrong. Please try again.' : error.message });
+  const databaseStatus = error.code === '23505' ? 409 :
+    error.code === '23503' || error.code === '22023' ? 400 : 0;
+  const status = error.status || databaseStatus || (error.type === 'entity.parse.failed' ? 400 : 500);
+  if (status >= 500) {
+    log('error', 'request_error', {
+      request_id: req.requestId,
+      method: req.method,
+      path: safeRoutePath(req.path),
+      error_code: error.code || error.type || 'unknown',
+      stack: error.stack
+    });
+  }
+  const message = status >= 500
+    ? 'Something went wrong. Please try again.'
+    : error.message || 'The database request could not be completed.';
+  res.status(status).json({ error: message });
 });
 
 async function start() {
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required. Copy .env.example to .env and configure PostgreSQL.');
-  await pool.query(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+  if (!process.env.ADMIN_API_KEY) throw new Error('ADMIN_API_KEY is required for kitchen sign-in.');
+  if (!process.env.SESSION_SECRET) throw new Error('SESSION_SECRET is required to sign kitchen sessions.');
+  supabase = createDatabaseClient();
+  const { error } = await supabase.from('BurgerByte').select('id, name, category, price, is_available').limit(1);
+  if (error) {
+    throw new Error(`Could not connect to Supabase or find the migrated BurgerByte table: ${error.message}`);
+  }
+  subscribeToDatabaseChanges();
   const port = Number(process.env.PORT) || 3000;
-  const server = app.listen(port, () => console.log(`ByteBurger is ready at http://localhost:${port}`));
-  const shutdown = () => server.close(() => pool.end().then(() => process.exit(0)));
+  const server = app.listen(port, () => console.log(`ByteBurger is ready at http://localhost:${port} (Supabase)`));
+  const shutdown = () => {
+    server.close(async () => {
+      if (realtimeChannel) await supabase.removeChannel(realtimeChannel);
+      process.exit(0);
+    });
+  };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }

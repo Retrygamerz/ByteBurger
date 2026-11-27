@@ -1,5 +1,6 @@
 # Dependencies
 **/node_modules/
+BackEND/data/
 
 # Environment files and secrets
 .env
